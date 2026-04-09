@@ -13,6 +13,7 @@ import AcceptedDrilldownModal from './components/AcceptedDrilldownModal';
 import SettingsMenu from './components/SettingsMenu';
 import ErrorBoundary from './components/ErrorBoundary';
 import { isWithinInterval, startOfDay, endOfDay } from 'date-fns';
+import { get as idbGet, set as idbSet } from 'idb-keyval';
 
 // Memoize heavy components
 const MemoizedKPIGrid = memo(KPIGrid);
@@ -26,12 +27,20 @@ const MemoizedAcceptedDrilldownModal = memo(AcceptedDrilldownModal);
 const MemoizedSettingsMenu = memo(SettingsMenu);
 
 const safeLocalStorageSet = (key: string, value: string) => {
+  // If the key is for large data, use IndexedDB instead of localStorage
+  if (key.startsWith('qc_dashboard_cached_data') || key.startsWith('qc_dashboard_cached_headers')) {
+    idbSet(key, value).catch(err => {
+      console.error("IndexedDB storage failed:", err);
+    });
+    return;
+  }
+
   try {
     localStorage.setItem(key, value);
   } catch (error) {
     console.warn("Storage quota exceeded, clearing all sheet caches to prevent crash.");
     try {
-      // Clear all cached data and headers for all sheets
+      // Clear all cached data and headers for all sheets from localStorage
       const keysToRemove: string[] = [];
       for (let i = 0; i < localStorage.length; i++) {
         const k = localStorage.key(i);
@@ -47,7 +56,9 @@ const safeLocalStorageSet = (key: string, value: string) => {
       // Attempt to save again after clearing space
       localStorage.setItem(key, value); 
     } catch (fallbackError) {
-      console.error("Storage completely full or item too large, bypassing cache entirely.");
+      // If it still fails, it's likely too large for localStorage, but we already handled large keys above
+      // This catch is for other keys that might be unexpectedly large
+      console.warn("Item too large for localStorage, bypassing cache.");
     }
   }
 };
@@ -261,11 +272,11 @@ const App: React.FC = () => {
   }, [config.mapping, findHeaderMatch]);
 
   const loadData = useCallback(async (silent = false, overrideSheetName?: string) => {
-    const targetSheet = overrideSheetName || config.sheetName;
+    const targetSheet = (overrideSheetName || config.sheetName).trim();
     
     // Immediate UI update from cache if switching sheets explicitly
     if (overrideSheetName && !silent) {
-      const cached = sheetCache.current[overrideSheetName];
+      const cached = sheetCache.current[targetSheet];
       if (cached) {
         setData(cached.data);
         setHeaders(cached.headers);
@@ -286,13 +297,13 @@ const App: React.FC = () => {
     try {
       const { data: rawData, headers: sheetHeaders } = await fetchSheetData(config.url, targetSheet);
       
-      // Performance: Avoid re-processing if data hasn't changed
-      const currentDataStr = JSON.stringify(rawData);
-      if (silent && currentDataStr === lastRawData.current) {
+      // Lightweight Diffing Heuristic: Compare length and a quick hash of first/last rows
+      const currentHash = rawData.length + "-" + (rawData.length > 0 ? JSON.stringify(rawData[0]) + JSON.stringify(rawData[rawData.length - 1]) : "");
+      if (silent && currentHash === lastRawData.current) {
         lastSyncTime.current = new Date();
         return;
       }
-      lastRawData.current = currentDataStr;
+      lastRawData.current = currentHash;
       lastSyncTime.current = new Date();
 
       setHeaders(sheetHeaders);
@@ -325,21 +336,6 @@ const App: React.FC = () => {
         return acc;
       }, []);
 
-      // Background sync: update internal dataset ONLY, do not trigger UI refresh
-      if (silent) {
-        latestDataRef.current = updatedData;
-        latestHeadersRef.current = sheetHeaders;
-        latestMappingRef.current = updatedMapping;
-        
-        // Still update cache for persistence
-        sheetCache.current[targetSheet] = { data: updatedData, headers: sheetHeaders };
-        safeLocalStorageSet(`qc_dashboard_cached_data_${targetSheet}`, JSON.stringify(updatedData));
-        safeLocalStorageSet(`qc_dashboard_cached_headers_${targetSheet}`, JSON.stringify(sheetHeaders));
-        
-        setError(null);
-        return;
-      }
-
       // Use requestAnimationFrame for smooth UI update
       requestAnimationFrame(() => {
         setData(updatedData);
@@ -358,6 +354,11 @@ const App: React.FC = () => {
         sheetCache.current[targetSheet] = { data: updatedData, headers: sheetHeaders };
         safeLocalStorageSet(`qc_dashboard_cached_data_${targetSheet}`, JSON.stringify(updatedData));
         safeLocalStorageSet(`qc_dashboard_cached_headers_${targetSheet}`, JSON.stringify(sheetHeaders));
+
+        // Update refs
+        latestDataRef.current = updatedData;
+        latestHeadersRef.current = sheetHeaders;
+        latestMappingRef.current = updatedMapping;
 
         setError(null);
         if (!silent) setSyncMessage('success', 'Data synced successfully');
@@ -387,7 +388,7 @@ const App: React.FC = () => {
     }
   }, [config.url, config.sheetName, autoDetectMapping, selectedBatches.length, config.mapping]);
 
-  const handleConfigUpdate = useCallback((newConfig: SheetConfig) => {
+  const handleConfigUpdate = useCallback(async (newConfig: SheetConfig) => {
     syncLatestData();
     const isSheetSwitch = config.sheetName !== newConfig.sheetName;
     if (isSheetSwitch) {
@@ -397,11 +398,20 @@ const App: React.FC = () => {
         setData(cached.data);
         setHeaders(cached.headers);
       } else {
-        // Fallback to localStorage if ref is empty
-        const savedData = localStorage.getItem(`qc_dashboard_cached_data_${newConfig.sheetName}`);
-        const savedHeaders = localStorage.getItem(`qc_dashboard_cached_headers_${newConfig.sheetName}`);
-        if (savedData && savedHeaders) {
-          try {
+        // Fallback to IndexedDB/localStorage if ref is empty
+        const dataKey = `qc_dashboard_cached_data_${newConfig.sheetName}`;
+        const headersKey = `qc_dashboard_cached_headers_${newConfig.sheetName}`;
+        
+        try {
+          // Try IndexedDB first
+          let savedData = await idbGet(dataKey) as string;
+          let savedHeaders = await idbGet(headersKey) as string;
+          
+          // Fallback to localStorage for legacy data
+          if (!savedData) savedData = localStorage.getItem(dataKey) || localStorage.getItem('qc_dashboard_cached_data') || '';
+          if (!savedHeaders) savedHeaders = localStorage.getItem(headersKey) || localStorage.getItem('qc_dashboard_cached_headers') || '';
+
+          if (savedData && savedHeaders) {
             const parsedData = JSON.parse(savedData);
             setData(parsedData.map((row: any) => ({
               ...row,
@@ -409,11 +419,11 @@ const App: React.FC = () => {
               _parsedDate: row._parsedDate ? new Date(row._parsedDate) : null
             })));
             setHeaders(JSON.parse(savedHeaders));
-          } catch (e) {
+          } else {
             setData([]);
             setHeaders([]);
           }
-        } else {
+        } catch (e) {
           setData([]);
           setHeaders([]);
         }
@@ -477,6 +487,36 @@ const App: React.FC = () => {
   }, [config.mapping?.date, data.length]);
 
   // Initial load: Use silent sync if we have cached data to avoid loading spinner
+  useEffect(() => {
+    const loadInitialCache = async () => {
+      const dataKey = `qc_dashboard_cached_data_${config.sheetName}`;
+      const headersKey = `qc_dashboard_cached_headers_${config.sheetName}`;
+      
+      try {
+        const [savedData, savedHeaders] = await Promise.all([
+          idbGet(dataKey),
+          idbGet(headersKey)
+        ]);
+
+        if (savedData && savedHeaders) {
+          const parsedData = JSON.parse(savedData as string);
+          setData(parsedData.map((row: any) => ({
+            ...row,
+            date: row.date ? new Date(row.date) : null,
+            _parsedDate: row._parsedDate ? new Date(row._parsedDate) : null
+          })));
+          setHeaders(JSON.parse(savedHeaders as string));
+        }
+      } catch (err) {
+        console.error("Failed to load initial cache from IndexedDB:", err);
+      }
+    };
+
+    if (data.length === 0) {
+      loadInitialCache();
+    }
+  }, [config.sheetName]);
+
   useEffect(() => { 
     if (config.url) {
       if (data.length > 0) {
@@ -510,16 +550,19 @@ const App: React.FC = () => {
     };
   }, [config.url, config.sheetName, loadData, loading, syncLatestData]);
 
-  // Auto-sync every 10 minutes, ONLY when tab is active and online
+  // Silent Live Sync (Smart Polling) every 30 seconds
   useEffect(() => {
+    if (!config.url) return;
+    
     const interval = setInterval(() => {
-      if (document.visibilityState === 'visible' && config.url && !loading && navigator.onLine) {
+      if (document.visibilityState === 'visible' && !loading && navigator.onLine) {
         lastSyncAttempt.current = Date.now();
-        loadData(true);
+        loadData(true); // silent = true
       }
-    }, 10 * 60 * 1000);
+    }, 30 * 1000); // 30 seconds
+    
     return () => clearInterval(interval);
-  }, [config.url, config.sheetName, loadData, loading]);
+  }, [config.url, loadData, loading]);
 
   const allUniqueBatches = useMemo(() => {
     const batchCol = config.mapping?.batchNo;
