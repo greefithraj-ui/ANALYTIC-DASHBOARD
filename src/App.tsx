@@ -286,28 +286,33 @@ const App: React.FC = () => {
 
       setHeaders(sheetHeaders);
       
-      const updatedMapping = autoDetectMapping(sheetHeaders);
+      const updatedMapping = autoDetectMapping(sheetHeaders || []);
       if (JSON.stringify(updatedMapping) !== JSON.stringify(config.mapping)) {
         setConfig(prev => ({ ...prev, mapping: updatedMapping }));
       }
 
       // Pre-parse dates and extract unique batches in a single pass
       const batchCol = updatedMapping.batchNo;
-      const hasBatchCol = batchCol && sheetHeaders.includes(batchCol);
+      const hasBatchCol = batchCol && (sheetHeaders || []).includes(batchCol);
       const uniqueBatchesSet = new Set<string>();
 
-      const updatedData = rawData.map(row => {
-        const parsedDate = parseDate(String(row[updatedMapping.date] || ''));
-        if (hasBatchCol) {
-          const batchVal = String(row[batchCol] || '').trim();
-          if (batchVal) uniqueBatchesSet.add(batchVal);
+      const updatedData = (rawData || []).reduce((acc: any[], row: any) => {
+        try {
+          const parsedDate = parseDate(String(row[updatedMapping.date] || ''));
+          if (hasBatchCol) {
+            const batchVal = String(row[batchCol] || '').trim();
+            if (batchVal) uniqueBatchesSet.add(batchVal);
+          }
+          acc.push({
+            ...row,
+            date: parsedDate,
+            _parsedDate: parsedDate
+          });
+        } catch (e) {
+          console.error("Failed to parse row:", row, e);
         }
-        return {
-          ...row,
-          date: parsedDate,
-          _parsedDate: parsedDate
-        };
-      });
+        return acc;
+      }, []);
 
       // Background sync: update internal dataset ONLY, do not trigger UI refresh
       if (silent) {
@@ -430,11 +435,11 @@ const App: React.FC = () => {
 
   const allUniqueBatches = useMemo(() => {
     const batchCol = config.mapping?.batchNo;
-    if (!batchCol || !headers.includes(batchCol)) {
+    if (!batchCol || !(headers || []).includes(batchCol)) {
       console.log('App: Batch column not found in headers:', batchCol, headers);
       return [];
     }
-    const unique = Array.from(new Set(data.map(r => String(r[batchCol] || '').trim())))
+    const unique = Array.from(new Set((data || []).map(r => String(r[batchCol] || '').trim())))
       .filter(Boolean)
       .sort((a: string, b: string) => b.localeCompare(a, undefined, { numeric: true, sensitivity: 'base' }));
     console.log('App: Found unique batches:', unique.length);
@@ -443,7 +448,7 @@ const App: React.FC = () => {
 
   const filteredData = useMemo(() => {
     const mapping = config.mapping || DEFAULT_MAPPING;
-    if (data.length === 0) return [];
+    if (!data || data.length === 0) return [];
 
     const parsedStartDate = dateRange.start ? new Date(dateRange.start) : null;
     if (parsedStartDate) parsedStartDate.setHours(0, 0, 0, 0);
@@ -452,14 +457,14 @@ const App: React.FC = () => {
     if (parsedEndDate) parsedEndDate.setHours(0, 0, 0, 0);
 
     const batchCol = mapping.batchNo;
-    const hasBatchFilter = batchCol && headers.includes(batchCol) && selectedBatches.length > 0 && selectedBatches.length < allUniqueBatches.length;
-    const searchTerm = debouncedUidSearch.trim().toLowerCase();
+    const hasBatchFilter = batchCol && (headers || []).includes(batchCol) && (selectedBatches || []).length > 0 && (selectedBatches || []).length < (allUniqueBatches || []).length;
+    const searchTerm = (debouncedUidSearch || '').trim().toLowerCase();
     const uidCol = mapping.uid;
 
     const dateCol = mapping.date;
-    const hasDateMapping = dateCol && headers.includes(dateCol);
+    const hasDateMapping = dateCol && (headers || []).includes(dateCol);
 
-    return data.filter(row => {
+    return (data || []).filter(row => {
       // Date Filter
       if (hasDateMapping && (parsedStartDate || parsedEndDate)) {
         const rawRowDate = row.date;
@@ -503,7 +508,7 @@ const App: React.FC = () => {
     let inwardCount = 0;
     let movedToInventory = 0;
 
-    filteredData.forEach(r => {
+    (filteredData || []).forEach(r => {
       const uid = String(r[mapping.uid] || '').trim();
       const sku = String(r[mapping.sku] || '').trim();
       
@@ -539,15 +544,15 @@ const App: React.FC = () => {
     const skuMap: Record<string, { total: number; accepted: number; rejected: number }> = {};
     
     let skuKey = mapping.sku;
-    if (!headers.includes(skuKey)) {
-      skuKey = findHeaderMatch(headers, ['sku', 'item', 'part', 'model']) || (headers.length > 0 ? headers[0] : '');
+    if (!(headers || []).includes(skuKey)) {
+      skuKey = findHeaderMatch(headers || [], ['sku', 'item', 'part', 'model']) || ((headers || []).length > 0 ? (headers || [])[0] : '');
     }
 
-    if (filteredData.length === 0 || !skuKey) {
+    if (!filteredData || filteredData.length === 0 || !skuKey) {
       return [];
     }
 
-    filteredData.forEach(r => {
+    (filteredData || []).forEach(r => {
       const val = r[skuKey];
       if (val !== undefined && val !== null) {
         const sku = String(val).trim().replace(/[\u0000-\u001F\u007F-\u009F]/g, ""); 
@@ -754,12 +759,12 @@ ${rejectedDetailsStr || 'None'}
         ) : (
           <div className="animate-in fade-in duration-700 space-y-10 w-full">
             <MemoizedFilterSection 
-              batches={allUniqueBatches} 
-              selectedBatches={selectedBatches} 
+              batches={allUniqueBatches || []} 
+              selectedBatches={selectedBatches || []} 
               setSelectedBatches={handleSetSelectedBatches} 
               dateRange={dateRange} 
               setDateRange={handleSetDateRange}
-              uidSearch={uidSearch}
+              uidSearch={uidSearch || ''}
               setUidSearch={handleSetUidSearch}
               loading={loading}
             />
@@ -769,11 +774,11 @@ ${rejectedDetailsStr || 'None'}
               onRejectedClick={handleOpenRejectionModal} 
               onAcceptedClick={handleOpenAcceptedModal}
               onWipClick={handleOpenWipModal}
-              filteredData={filteredData}
+              filteredData={filteredData || []}
               mapping={config.mapping || DEFAULT_MAPPING}
             />
             
-            {data.length > 0 && (
+            {(data || []).length > 0 && (
               <>
                 <div className="flex items-center justify-between px-6 py-4 bg-[#161a23] rounded-2xl border border-white/5">
                   <div className="flex items-center gap-6">
@@ -785,20 +790,20 @@ ${rejectedDetailsStr || 'None'}
                     </p>
                   </div>
                   <p className="text-[10px] font-bold text-[#9ca3af] uppercase tracking-[0.2em] mono">
-                    Total Records: <span className="text-white bg-white/5 px-2 py-0.5 rounded ml-2">{filteredData.length}</span>
+                    Total Records: <span className="text-white bg-white/5 px-2 py-0.5 rounded ml-2">{(filteredData || []).length}</span>
                   </p>
                 </div>
                 
                 <div style={{ contentVisibility: 'auto' }}>
-                  <MemoizedSKUDetailsSection skuDetails={skuDetails} loading={loading} />
+                  <MemoizedSKUDetailsSection skuDetails={skuDetails || []} loading={loading} />
                 </div>
                 
                 <div className="pb-10 min-h-[500px]" style={{ contentVisibility: 'auto' }}>
                   <MemoizedRejectionDetailsSection 
-                    filteredData={filteredData} 
-                    allData={data} 
+                    filteredData={filteredData || []} 
+                    allData={data || []} 
                     mapping={config.mapping || DEFAULT_MAPPING} 
-                    headers={headers} 
+                    headers={headers || []} 
                     loading={loading}
                   />
                 </div>
@@ -817,27 +822,27 @@ ${rejectedDetailsStr || 'None'}
         </div>
       )}
 
-      <MemoizedSettingsMenu config={{...config, mapping: config.mapping || DEFAULT_MAPPING}} headers={headers} onUpdate={handleConfigUpdate} isOpen={isSettingsOpen} setIsOpen={setIsSettingsOpen} isRefreshing={loading} />
+      <MemoizedSettingsMenu config={{...config, mapping: config.mapping || DEFAULT_MAPPING}} headers={headers || []} onUpdate={handleConfigUpdate} isOpen={isSettingsOpen} setIsOpen={setIsSettingsOpen} isRefreshing={loading} />
       
       <MemoizedRejectionDrilldownModal 
         isOpen={isRejectionModalOpen} 
         onClose={handleCloseRejectionModal} 
-        data={filteredData} 
+        data={filteredData || []} 
         mapping={config.mapping || DEFAULT_MAPPING} 
       />
 
       <MemoizedAcceptedDrilldownModal 
         isOpen={isAcceptedModalOpen} 
         onClose={handleCloseAcceptedModal} 
-        data={filteredData} 
+        data={filteredData || []} 
         mapping={config.mapping || DEFAULT_MAPPING} 
       />
 
       <MemoizedWipDrilldownModal 
         isOpen={isWipModalOpen}
         onClose={handleCloseWipModal}
-        data={filteredData}
-        headers={headers}
+        data={filteredData || []}
+        headers={headers || []}
       />
     </div>
     </ErrorBoundary>
