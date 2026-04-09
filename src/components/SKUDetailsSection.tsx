@@ -158,9 +158,13 @@ const SKUDetailsSection: React.FC<SKUDetailsSectionProps> = ({ skuDetails, loadi
                 Table: (props) => <table {...props} className="w-full text-left border-collapse" />,
                 TableRow: (props) => <tr {...props} className="hover:bg-white/[0.03] transition-all group" />,
                 EmptyPlaceholder: () => (
-                  <div className="px-6 py-12 text-center text-[#9ca3af]/40 italic uppercase text-[10px] font-black tracking-[0.3em]">
-                    {loading ? 'Fetching SKU Performance Data...' : 'No matching records found'}
-                  </div>
+                  <tbody>
+                    <tr>
+                      <td colSpan={5} className="px-6 py-12 text-center text-[#9ca3af]/40 italic uppercase text-[10px] font-black tracking-[0.3em]">
+                        {loading ? 'Fetching SKU Performance Data...' : 'No matching records found'}
+                      </td>
+                    </tr>
+                  </tbody>
                 )
               }}
             />

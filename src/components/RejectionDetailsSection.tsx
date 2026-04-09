@@ -156,9 +156,13 @@ const RejectionDetailsSection: React.FC<RejectionDetailsSectionProps> = ({ filte
                 Table: (props) => <table {...props} className="w-full text-left border-collapse" />,
                 TableRow: (props) => <tr {...props} className="hover:bg-white/[0.03] transition-all group" />,
                 EmptyPlaceholder: () => (
-                  <div className="px-6 py-12 text-center text-[#9ca3af]/30 italic text-[10px] font-black uppercase tracking-[0.3em]">
-                    {loading ? 'Analyzing Rejection Patterns...' : 'No rejection data recorded'}
-                  </div>
+                  <tbody>
+                    <tr>
+                      <td colSpan={2} className="px-6 py-12 text-center text-[#9ca3af]/30 italic text-[10px] font-black uppercase tracking-[0.3em]">
+                        {loading ? 'Analyzing Rejection Patterns...' : 'No rejection data recorded'}
+                      </td>
+                    </tr>
+                  </tbody>
                 )
               }}
             />

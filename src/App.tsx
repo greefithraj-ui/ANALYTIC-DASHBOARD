@@ -29,14 +29,25 @@ const safeLocalStorageSet = (key: string, value: string) => {
   try {
     localStorage.setItem(key, value);
   } catch (error) {
-    console.warn("Storage quota exceeded, clearing cache to prevent crash.");
+    console.warn("Storage quota exceeded, clearing all sheet caches to prevent crash.");
     try {
-      localStorage.removeItem('qc_dashboard_cached_data');
-      localStorage.removeItem('qc_dashboard_cached_headers');
+      // Clear all cached data and headers for all sheets
+      const keysToRemove: string[] = [];
+      for (let i = 0; i < localStorage.length; i++) {
+        const k = localStorage.key(i);
+        if (k && (
+          k.startsWith('qc_dashboard_cached_data') || 
+          k.startsWith('qc_dashboard_cached_headers')
+        )) {
+          keysToRemove.push(k);
+        }
+      }
+      keysToRemove.forEach(k => localStorage.removeItem(k));
+      
       // Attempt to save again after clearing space
       localStorage.setItem(key, value); 
     } catch (fallbackError) {
-      console.error("Storage completely full, bypassing cache entirely.");
+      console.error("Storage completely full or item too large, bypassing cache entirely.");
     }
   }
 };
@@ -62,7 +73,15 @@ const App: React.FC = () => {
   });
   
   const [data, setData] = useState<DashboardRow[]>(() => {
-    const saved = localStorage.getItem('qc_dashboard_cached_data');
+    const savedConfig = localStorage.getItem('qc_dashboard_config');
+    let sheetName = INITIAL_CONFIG.sheetName;
+    if (savedConfig) {
+      try {
+        const parsed = JSON.parse(savedConfig);
+        if (parsed?.sheetName) sheetName = parsed.sheetName;
+      } catch (e) {}
+    }
+    const saved = localStorage.getItem(`qc_dashboard_cached_data_${sheetName}`) || localStorage.getItem('qc_dashboard_cached_data');
     if (!saved) return [];
     try {
       const parsed = JSON.parse(saved) as DashboardRow[];
@@ -78,7 +97,15 @@ const App: React.FC = () => {
     }
   });
   const [headers, setHeaders] = useState<string[]>(() => {
-    const saved = localStorage.getItem('qc_dashboard_cached_headers');
+    const savedConfig = localStorage.getItem('qc_dashboard_config');
+    let sheetName = INITIAL_CONFIG.sheetName;
+    if (savedConfig) {
+      try {
+        const parsed = JSON.parse(savedConfig);
+        if (parsed?.sheetName) sheetName = parsed.sheetName;
+      } catch (e) {}
+    }
+    const saved = localStorage.getItem(`qc_dashboard_cached_headers_${sheetName}`) || localStorage.getItem('qc_dashboard_cached_headers');
     return saved ? JSON.parse(saved) : [];
   });
   const [loading, setLoading] = useState(false);
@@ -90,6 +117,11 @@ const App: React.FC = () => {
   const latestDataRef = useRef<DashboardRow[] | null>(null);
   const latestHeadersRef = useRef<string[] | null>(null);
   const latestMappingRef = useRef<any>(null);
+  const sheetCache = useRef<Record<string, { data: DashboardRow[], headers: string[] }>>({});
+  const lastDateMapping = useRef(INITIAL_CONFIG.mapping?.date);
+  const lastRawData = useRef<string>('');
+  const lastSyncTime = useRef<Date>(new Date());
+  const lastSyncAttempt = useRef<number>(Date.now());
 
   const syncLatestData = useCallback(() => {
     if (latestDataRef.current) {
@@ -167,54 +199,6 @@ const App: React.FC = () => {
     setUidSearch(search);
   }, [syncLatestData]);
 
-  const handleConfigUpdate = useCallback((newConfig: SheetConfig) => {
-    syncLatestData();
-    if (config.sheetName !== newConfig.sheetName) {
-      setData([]);
-      setSelectedBatches([]);
-      setDateRange({ start: null, end: null });
-      setUidSearch('');
-      setIsRejectionModalOpen(false);
-      setIsAcceptedModalOpen(false);
-      setIsWipModalOpen(false);
-    }
-    setConfig(newConfig);
-    safeLocalStorageSet('qc_dashboard_config', JSON.stringify(newConfig));
-  }, [syncLatestData, config.sheetName]);
-
-  const handleSheetToggle = (sheetName: string) => {
-    if (config.sheetName === sheetName) return;
-    handleConfigUpdate({ ...config, sheetName });
-  };
-
-  // Persistence effects
-  useEffect(() => {
-    safeLocalStorageSet('qc_dashboard_selected_batches', JSON.stringify(selectedBatches));
-  }, [selectedBatches]);
-
-  useEffect(() => {
-    safeLocalStorageSet('qc_dashboard_date_range', JSON.stringify(dateRange));
-  }, [dateRange]);
-
-  useEffect(() => {
-    safeLocalStorageSet('qc_dashboard_uid_search', uidSearch);
-  }, [uidSearch]);
-
-  useEffect(() => {
-    if (data.length > 0) {
-      safeLocalStorageSet('qc_dashboard_cached_data', JSON.stringify(data));
-    }
-  }, [data]);
-
-  useEffect(() => {
-    if (headers.length > 0) {
-      safeLocalStorageSet('qc_dashboard_cached_headers', JSON.stringify(headers));
-    }
-  }, [headers]);
-
-  const lastRawData = useRef<string>('');
-  const lastSyncTime = useRef<Date>(new Date());
-
   // Robust column detection with priority on SKU
   const findHeaderMatch = useCallback((availableHeaders: string[], searchTerms: string[]): string | undefined => {
     if (!availableHeaders.length) return undefined;
@@ -276,7 +260,18 @@ const App: React.FC = () => {
     return mapping;
   }, [config.mapping, findHeaderMatch]);
 
-  const loadData = useCallback(async (silent = false) => {
+  const loadData = useCallback(async (silent = false, overrideSheetName?: string) => {
+    const targetSheet = overrideSheetName || config.sheetName;
+    
+    // Immediate UI update from cache if switching sheets explicitly
+    if (overrideSheetName && !silent) {
+      const cached = sheetCache.current[overrideSheetName];
+      if (cached) {
+        setData(cached.data);
+        setHeaders(cached.headers);
+      }
+    }
+
     if (!config.url) {
       if (!silent) setError("CONFIGURATION REQUIRED: Please link a valid public Google Sheet.");
       return;
@@ -289,7 +284,7 @@ const App: React.FC = () => {
     }
     
     try {
-      const { data: rawData, headers: sheetHeaders } = await fetchSheetData(config.url, config.sheetName);
+      const { data: rawData, headers: sheetHeaders } = await fetchSheetData(config.url, targetSheet);
       
       // Performance: Avoid re-processing if data hasn't changed
       const currentDataStr = JSON.stringify(rawData);
@@ -337,8 +332,9 @@ const App: React.FC = () => {
         latestMappingRef.current = updatedMapping;
         
         // Still update cache for persistence
-        safeLocalStorageSet('qc_dashboard_cached_data', JSON.stringify(updatedData));
-        safeLocalStorageSet('qc_dashboard_cached_headers', JSON.stringify(sheetHeaders));
+        sheetCache.current[targetSheet] = { data: updatedData, headers: sheetHeaders };
+        safeLocalStorageSet(`qc_dashboard_cached_data_${targetSheet}`, JSON.stringify(updatedData));
+        safeLocalStorageSet(`qc_dashboard_cached_headers_${targetSheet}`, JSON.stringify(sheetHeaders));
         
         setError(null);
         return;
@@ -358,6 +354,11 @@ const App: React.FC = () => {
           }
         }
         
+        // Save to cache
+        sheetCache.current[targetSheet] = { data: updatedData, headers: sheetHeaders };
+        safeLocalStorageSet(`qc_dashboard_cached_data_${targetSheet}`, JSON.stringify(updatedData));
+        safeLocalStorageSet(`qc_dashboard_cached_headers_${targetSheet}`, JSON.stringify(sheetHeaders));
+
         setError(null);
         if (!silent) setSyncMessage('success', 'Data synced successfully');
       });
@@ -384,9 +385,82 @@ const App: React.FC = () => {
     } finally {
       if (!silent) setLoading(false);
     }
-  }, [config.url, config.sheetName, autoDetectMapping, selectedBatches.length]);
+  }, [config.url, config.sheetName, autoDetectMapping, selectedBatches.length, config.mapping]);
 
-  const lastDateMapping = useRef(config.mapping?.date);
+  const handleConfigUpdate = useCallback((newConfig: SheetConfig) => {
+    syncLatestData();
+    const isSheetSwitch = config.sheetName !== newConfig.sheetName;
+    if (isSheetSwitch) {
+      // Check cache first for immediate UI update
+      const cached = sheetCache.current[newConfig.sheetName];
+      if (cached) {
+        setData(cached.data);
+        setHeaders(cached.headers);
+      } else {
+        // Fallback to localStorage if ref is empty
+        const savedData = localStorage.getItem(`qc_dashboard_cached_data_${newConfig.sheetName}`);
+        const savedHeaders = localStorage.getItem(`qc_dashboard_cached_headers_${newConfig.sheetName}`);
+        if (savedData && savedHeaders) {
+          try {
+            const parsedData = JSON.parse(savedData);
+            setData(parsedData.map((row: any) => ({
+              ...row,
+              date: row.date ? new Date(row.date) : null,
+              _parsedDate: row._parsedDate ? new Date(row._parsedDate) : null
+            })));
+            setHeaders(JSON.parse(savedHeaders));
+          } catch (e) {
+            setData([]);
+            setHeaders([]);
+          }
+        } else {
+          setData([]);
+          setHeaders([]);
+        }
+      }
+      setSelectedBatches([]);
+      setDateRange({ start: null, end: null });
+      setUidSearch('');
+      setIsRejectionModalOpen(false);
+      setIsAcceptedModalOpen(false);
+      setIsWipModalOpen(false);
+    }
+    setConfig(newConfig);
+    safeLocalStorageSet('qc_dashboard_config', JSON.stringify(newConfig));
+    
+    // Explicitly trigger load with the new sheet name
+    loadData(false, newConfig.sheetName);
+  }, [syncLatestData, config.sheetName, loadData]);
+
+  const handleSheetToggle = (sheetName: string) => {
+    if (config.sheetName === sheetName) return;
+    handleConfigUpdate({ ...config, sheetName });
+  };
+
+  // Persistence effects
+  useEffect(() => {
+    safeLocalStorageSet('qc_dashboard_selected_batches', JSON.stringify(selectedBatches));
+  }, [selectedBatches]);
+
+  useEffect(() => {
+    safeLocalStorageSet('qc_dashboard_date_range', JSON.stringify(dateRange));
+  }, [dateRange]);
+
+  useEffect(() => {
+    safeLocalStorageSet('qc_dashboard_uid_search', uidSearch);
+  }, [uidSearch]);
+
+  useEffect(() => {
+    if (data.length > 0) {
+      safeLocalStorageSet('qc_dashboard_cached_data', JSON.stringify(data));
+    }
+  }, [data]);
+
+  useEffect(() => {
+    if (headers.length > 0) {
+      safeLocalStorageSet('qc_dashboard_cached_headers', JSON.stringify(headers));
+    }
+  }, [headers]);
 
   useEffect(() => {
     if (data.length > 0 && config.mapping?.date && lastDateMapping.current !== config.mapping.date) {
@@ -401,8 +475,6 @@ const App: React.FC = () => {
       }));
     }
   }, [config.mapping?.date, data.length]);
-
-  const lastSyncAttempt = useRef<number>(Date.now());
 
   // Initial load: Use silent sync if we have cached data to avoid loading spinner
   useEffect(() => { 
