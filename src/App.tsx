@@ -153,14 +153,22 @@ const App: React.FC = () => {
 
   const handleConfigUpdate = useCallback((newConfig: SheetConfig) => {
     syncLatestData();
+    if (config.sheetName !== newConfig.sheetName) {
+      setData([]);
+      setSelectedBatches([]);
+      setDateRange({ start: null, end: null });
+      setUidSearch('');
+      setIsRejectionModalOpen(false);
+      setIsAcceptedModalOpen(false);
+      setIsWipModalOpen(false);
+    }
     setConfig(newConfig);
     localStorage.setItem('qc_dashboard_config', JSON.stringify(newConfig));
-  }, [syncLatestData]);
+  }, [syncLatestData, config.sheetName]);
 
   const handleSheetToggle = (sheetName: string) => {
     if (config.sheetName === sheetName) return;
     handleConfigUpdate({ ...config, sheetName });
-    setData([]);
   };
 
   // Persistence effects

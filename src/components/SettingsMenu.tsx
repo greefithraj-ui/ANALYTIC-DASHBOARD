@@ -1,5 +1,5 @@
 
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { Settings, X, RefreshCw, ChevronDown } from 'lucide-react';
 import { SheetConfig, ColumnMapping } from '../types';
 
@@ -21,6 +21,11 @@ const SettingsMenu: React.FC<SettingsMenuProps> = ({
   isRefreshing
 }) => {
   const [localConfig, setLocalConfig] = useState(config);
+
+  // Sync local draft state with global config when it changes (e.g. via header toggles)
+  useEffect(() => {
+    setLocalConfig(config);
+  }, [config]);
 
   const handleSave = () => {
     onUpdate(localConfig);
