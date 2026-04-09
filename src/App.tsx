@@ -2,7 +2,7 @@ import React, { useState, useEffect, useMemo, useCallback, useRef, memo } from '
 import { Menu, AlertCircle, ExternalLink, RefreshCw, Database, Copy, Check } from 'lucide-react';
 import { INITIAL_CONFIG, DEFAULT_MAPPING } from './constants';
 import { SheetConfig, DashboardRow, KPIStats, SKUDetail, RemainingQtyItem } from './types';
-import { fetchSheetData, parseDate } from './services/sheetService';
+import { fetchSheetData, parseDate, getColLetter } from './services/sheetService';
 import KPIGrid from './components/KPIGrid';
 import FilterSection from './components/FilterSection';
 import SKUDetailsSection from './components/SKUDetailsSection';
@@ -74,6 +74,7 @@ const App: React.FC = () => {
   const latestDataRef = useRef<DashboardRow[] | null>(null);
   const latestHeadersRef = useRef<string[] | null>(null);
   const latestMappingRef = useRef<any>(null);
+  const sheetCache = useRef<Record<string, { data: DashboardRow[], headers: string[], mapping: any }>>({});
 
   const syncLatestData = useCallback(() => {
     if (latestDataRef.current) {
@@ -156,6 +157,28 @@ const App: React.FC = () => {
     setConfig(newConfig);
     localStorage.setItem('qc_dashboard_config', JSON.stringify(newConfig));
   }, [syncLatestData]);
+
+  const handleSheetToggle = (sheetName: string) => {
+    if (config.sheetName === sheetName) return;
+    
+    // Check cache for instantaneous switch
+    if (sheetCache.current[sheetName]) {
+      const cached = sheetCache.current[sheetName];
+      setData(cached.data);
+      setHeaders(cached.headers);
+      handleConfigUpdate({ ...config, sheetName, mapping: cached.mapping });
+      setSyncMessage('success', `Loaded ${sheetName} from cache`);
+      return;
+    }
+
+    // Immediate UI feedback for non-cached sheets
+    setData([]);
+    setLoading(true);
+    setError(null);
+    setSyncMessage('syncing', `Switching to ${sheetName}...`);
+    
+    handleConfigUpdate({ ...config, sheetName });
+  };
 
   // Persistence effects
   useEffect(() => {
@@ -246,9 +269,24 @@ const App: React.FC = () => {
     return mapping;
   }, [config.mapping, findHeaderMatch]);
 
-  const loadData = useCallback(async (silent = false) => {
+  const loadData = useCallback(async (silent = false, force = false) => {
     if (!config.url) {
       if (!silent) setError("CONFIGURATION REQUIRED: Please link a valid public Google Sheet.");
+      return;
+    }
+    
+    // Check cache if not forcing a refresh
+    if (!force && sheetCache.current[config.sheetName]) {
+      const cached = sheetCache.current[config.sheetName];
+      setData(cached.data);
+      setHeaders(cached.headers);
+      if (JSON.stringify(cached.mapping) !== JSON.stringify(config.mapping)) {
+        setConfig(prev => ({ ...prev, mapping: cached.mapping }));
+      }
+      if (!silent) {
+        setSyncMessage('success', `Loaded ${config.sheetName} from cache`);
+        setLoading(false);
+      }
       return;
     }
     
@@ -259,73 +297,114 @@ const App: React.FC = () => {
     }
     
     try {
-      const { data: rawData, headers: sheetHeaders } = await fetchSheetData(config.url, config.sheetName);
-      
-      // Performance: Avoid re-processing if data hasn't changed
-      const currentDataStr = JSON.stringify(rawData);
-      if (silent && currentDataStr === lastRawData.current) {
-        lastSyncTime.current = new Date();
-        return;
+      // Build optimized query if mapping and headers are available
+      let query = undefined;
+      if (headers.length > 0 && config.mapping) {
+        const usedHeaders = new Set(Object.values(config.mapping).filter(Boolean) as string[]);
+        const usedIndices = headers
+          .map((h, i) => usedHeaders.has(h) ? i : -1)
+          .filter(i => i !== -1);
+        
+        if (usedIndices.length > 0) {
+          query = `select ${usedIndices.map(getColLetter).join(', ')}`;
+        }
       }
-      lastRawData.current = currentDataStr;
+
+      const { data: rawData, headers: sheetHeaders } = await fetchSheetData(config.url, config.sheetName, query);
+      
+      // Yield to main thread to keep UI responsive
+      await new Promise(resolve => requestAnimationFrame(resolve));
+
+      // Performance: Avoid expensive JSON.stringify on large datasets if possible
+      if (silent && rawData.length === data.length && data.length > 0) {
+        // Simple heuristic check for data change
+        const firstMatch = JSON.stringify(rawData[0]) === JSON.stringify(data[0]);
+        const lastMatch = JSON.stringify(rawData[rawData.length-1]) === JSON.stringify(data[data.length-1]);
+        if (firstMatch && lastMatch) {
+          lastSyncTime.current = new Date();
+          if (!silent) setLoading(false);
+          return;
+        }
+      }
+
+      lastRawData.current = JSON.stringify(rawData);
       lastSyncTime.current = new Date();
 
-      setHeaders(sheetHeaders);
-      
       const updatedMapping = autoDetectMapping(sheetHeaders);
-      if (JSON.stringify(updatedMapping) !== JSON.stringify(config.mapping)) {
-        setConfig(prev => ({ ...prev, mapping: updatedMapping }));
-      }
-
-      // Pre-parse dates and extract unique batches in a single pass
       const batchCol = updatedMapping.batchNo;
+      const dateCol = updatedMapping.date;
       const hasBatchCol = batchCol && sheetHeaders.includes(batchCol);
       const uniqueBatchesSet = new Set<string>();
 
-      const updatedData = rawData.map(row => {
-        const parsedDate = parseDate(String(row[updatedMapping.date] || ''));
+      // Single-pass processing with O(N) complexity
+      const updatedData = new Array(rawData.length);
+      const dateCache = new Map<string, Date | null>();
+
+      for (let i = 0; i < rawData.length; i++) {
+        const row = rawData[i];
+        const rawDateStr = String(row[dateCol] || '');
+        
+        let parsedDate = dateCache.get(rawDateStr);
+        if (parsedDate === undefined) {
+          parsedDate = parseDate(rawDateStr);
+          dateCache.set(rawDateStr, parsedDate);
+        }
+
         if (hasBatchCol) {
           const batchVal = String(row[batchCol] || '').trim();
           if (batchVal) uniqueBatchesSet.add(batchVal);
         }
-        return {
+        
+        updatedData[i] = {
           ...row,
           date: parsedDate,
           _parsedDate: parsedDate
         };
-      });
+      }
 
-      // Background sync: update internal dataset ONLY, do not trigger UI refresh
+      // Optimized batch update
+      const finalize = () => {
+        // Update cache
+        sheetCache.current[config.sheetName] = {
+          data: updatedData,
+          headers: sheetHeaders,
+          mapping: updatedMapping
+        };
+
+        // Batch all state updates
+        setData(updatedData);
+        setHeaders(sheetHeaders);
+        lastDateMapping.current = updatedMapping.date;
+        
+        if (JSON.stringify(updatedMapping) !== JSON.stringify(config.mapping)) {
+          setConfig(prev => ({ ...prev, mapping: updatedMapping }));
+        }
+
+        if (hasBatchCol && selectedBatches.length === 0) {
+          const uniqueBatches = Array.from(uniqueBatchesSet)
+            .sort((a: string, b: string) => b.localeCompare(a, undefined, { numeric: true, sensitivity: 'base' }));
+          setSelectedBatches(uniqueBatches);
+        }
+
+        setError(null);
+        setLoading(false);
+        if (!silent) setSyncMessage('success', 'Data synced successfully');
+        
+        // Update persistence asynchronously
+        setTimeout(() => {
+          localStorage.setItem('qc_dashboard_cached_data', JSON.stringify(updatedData));
+          localStorage.setItem('qc_dashboard_cached_headers', JSON.stringify(sheetHeaders));
+        }, 50);
+      };
+
       if (silent) {
         latestDataRef.current = updatedData;
         latestHeadersRef.current = sheetHeaders;
         latestMappingRef.current = updatedMapping;
-        
-        // Still update cache for persistence
-        localStorage.setItem('qc_dashboard_cached_data', JSON.stringify(updatedData));
-        localStorage.setItem('qc_dashboard_cached_headers', JSON.stringify(sheetHeaders));
-        
-        setError(null);
-        return;
+        finalize();
+      } else {
+        requestAnimationFrame(finalize);
       }
-
-      // Use requestAnimationFrame for smooth UI update
-      requestAnimationFrame(() => {
-        setData(updatedData);
-        lastDateMapping.current = updatedMapping.date;
-
-        if (hasBatchCol) {
-          const uniqueBatches = Array.from(uniqueBatchesSet)
-            .sort((a: string, b: string) => b.localeCompare(a, undefined, { numeric: true, sensitivity: 'base' }));
-          
-          if (selectedBatches.length === 0) {
-            setSelectedBatches(uniqueBatches);
-          }
-        }
-        
-        setError(null);
-        if (!silent) setSyncMessage('success', 'Data synced successfully');
-      });
     } catch (err: any) {
       console.error("Data sync failed:", err);
       const isNetworkError = err.message === 'Failed to fetch' || 
@@ -338,18 +417,11 @@ const App: React.FC = () => {
           : `SYNC ERROR: ${err.message || 'Unknown error occurred during data fetch.'}`;
         setError(userMessage);
         setSyncMessage('error', 'Sync failed');
-      } else {
-        // Silent error: just log it and keep previous data
-        if (!isNetworkError) {
-          console.error("Background sync failed:", err.message);
-        } else {
-          console.warn("Background sync skipped: Connection issue or timeout.");
-        }
       }
     } finally {
       if (!silent) setLoading(false);
     }
-  }, [config.url, config.sheetName, autoDetectMapping, selectedBatches.length]);
+  }, [config.url, config.sheetName, autoDetectMapping, selectedBatches.length, config.mapping, data.length]);
 
   const lastDateMapping = useRef(config.mapping?.date);
 
@@ -416,108 +488,96 @@ const App: React.FC = () => {
 
   const allUniqueBatches = useMemo(() => {
     const batchCol = config.mapping?.batchNo;
-    if (!batchCol || !headers.includes(batchCol)) {
-      console.log('App: Batch column not found in headers:', batchCol, headers);
-      return [];
+    if (!batchCol || !headers.includes(batchCol)) return [];
+    
+    const uniqueSet = new Set<string>();
+    for (let i = 0; i < data.length; i++) {
+      const val = String(data[i][batchCol] || '').trim();
+      if (val) uniqueSet.add(val);
     }
-    const unique = Array.from(new Set(data.map(r => String(r[batchCol] || '').trim())))
-      .filter(Boolean)
+    
+    return Array.from(uniqueSet)
       .sort((a: string, b: string) => b.localeCompare(a, undefined, { numeric: true, sensitivity: 'base' }));
-    console.log('App: Found unique batches:', unique.length);
-    return unique;
   }, [data, config.mapping?.batchNo, headers]);
 
   const filteredData = useMemo(() => {
     const mapping = config.mapping || DEFAULT_MAPPING;
     if (data.length === 0) return [];
 
-    const parsedStartDate = dateRange.start ? new Date(dateRange.start) : null;
-    if (parsedStartDate) parsedStartDate.setHours(0, 0, 0, 0);
-    
-    const parsedEndDate = dateRange.end ? new Date(dateRange.end) : null;
-    if (parsedEndDate) parsedEndDate.setHours(0, 0, 0, 0);
+    const parsedStartDate = dateRange.start ? dateRange.start.getTime() : null;
+    const parsedEndDate = dateRange.end ? dateRange.end.getTime() : null;
 
     const batchCol = mapping.batchNo;
     const hasBatchFilter = batchCol && headers.includes(batchCol) && selectedBatches.length > 0 && selectedBatches.length < allUniqueBatches.length;
     const searchTerm = debouncedUidSearch.trim().toLowerCase();
     const uidCol = mapping.uid;
-
     const dateCol = mapping.date;
     const hasDateMapping = dateCol && headers.includes(dateCol);
 
-    return data.filter(row => {
+    const result = [];
+    for (let i = 0; i < data.length; i++) {
+      const row = data[i];
+      
       // Date Filter
       if (hasDateMapping && (parsedStartDate || parsedEndDate)) {
-        const rawRowDate = row.date;
-        const rowDate = rawRowDate instanceof Date ? rawRowDate : (rawRowDate ? new Date(rawRowDate) : null);
-        
-        // If a row has a blank or invalid date, exclude it when a filter is active
-        if (!rowDate || isNaN(rowDate.getTime())) return false;
-        
-        // Ensure rowDate is also forced to local midnight for comparison if not already
-        // (Though parseDate should have already handled this)
-        const rowTime = new Date(rowDate.getTime());
-        rowTime.setHours(0, 0, 0, 0);
-
-        const isAfterStart = !parsedStartDate || rowTime.getTime() >= parsedStartDate.getTime();
-        const isBeforeEnd = !parsedEndDate || rowTime.getTime() <= parsedEndDate.getTime();
-
-        if (!isAfterStart || !isBeforeEnd) return false;
+        const rowDate = row.date;
+        if (!rowDate) continue;
+        const rowTime = rowDate.getTime();
+        if (parsedStartDate && rowTime < parsedStartDate) continue;
+        if (parsedEndDate && rowTime > parsedEndDate) continue;
       }
       
       // Batch Filter
       if (hasBatchFilter) {
         const rowBatch = String(row[batchCol] || '').trim();
-        if (!selectedBatches.includes(rowBatch)) return false;
+        if (!selectedBatches.includes(rowBatch)) continue;
       }
 
       // UID Search Filter
       if (searchTerm) {
         const rowUid = String(row[uidCol] || '').toLowerCase();
-        if (!rowUid.includes(searchTerm)) return false;
+        if (!rowUid.includes(searchTerm)) continue;
       }
 
-      return true;
-    });
+      result.push(row);
+    }
+    return result;
   }, [data, config, dateRange, selectedBatches, debouncedUidSearch, headers, allUniqueBatches]);
 
   const stats: KPIStats = useMemo(() => {
     const mapping = config.mapping || DEFAULT_MAPPING;
-    let total = 0;
-    let accepted = 0;
-    let rejected = 0;
+    const s = { total: 0, accepted: 0, rejected: 0, wip: 0, yield: 0, movedToInventory: 0 };
     let inwardCount = 0;
-    let movedToInventory = 0;
 
-    filteredData.forEach(r => {
-      const uid = String(r[mapping.uid] || '').trim();
-      const sku = String(r[mapping.sku] || '').trim();
+    const uidCol = mapping.uid;
+    const skuCol = mapping.sku;
+    const statusCol = mapping.ringStatus;
+    const inwardCol = mapping.inward;
+    const movedCol = mapping.movedToInventory;
+
+    for (let i = 0; i < filteredData.length; i++) {
+      const r = filteredData[i];
+      const uid = String(r[uidCol] || '').trim();
+      const sku = String(r[skuCol] || '').trim();
       
-      // Only count rows that have either a UID or an SKU
       if (uid !== '' || sku !== '') {
-        total++;
-        const status = String(r[mapping.ringStatus] || '').trim().toLowerCase();
+        s.total++;
+        const status = String(r[statusCol] || '').trim().toLowerCase();
         if (['accepted', 'ok', 'pass', '1', 'true', 'yes'].includes(status)) {
-          accepted++;
+          s.accepted++;
         } else if (['rejected', 'nok', 'fail', '0', 'false', 'no'].includes(status)) {
-          rejected++;
+          s.rejected++;
         }
       }
 
-      if (String(r[mapping.inward] || '').trim() !== '') {
-        inwardCount++;
-      }
+      if (String(r[inwardCol] || '').trim() !== '') inwardCount++;
+      if (String(r[movedCol] || '').trim() !== '') s.movedToInventory++;
+    }
 
-      const movedVal = String(r[mapping.movedToInventory] || '').trim();
-      if (movedVal !== '') {
-        movedToInventory++;
-      }
-    });
-
-    const wip = Math.max(0, inwardCount - total);
-    const yieldVal = total > 0 ? (accepted / total) * 100 : 0;
+    s.wip = Math.max(0, inwardCount - s.total);
+    s.yield = s.total > 0 ? (s.accepted / s.total) * 100 : 0;
     
-    return { total, accepted, rejected, wip, yield: yieldVal, movedToInventory };
+    return s;
   }, [filteredData, config]);
 
   const skuDetails = useMemo(() => {
@@ -529,29 +589,28 @@ const App: React.FC = () => {
       skuKey = findHeaderMatch(headers, ['sku', 'item', 'part', 'model']) || (headers.length > 0 ? headers[0] : '');
     }
 
-    if (filteredData.length === 0 || !skuKey) {
-      return [];
-    }
+    if (filteredData.length === 0 || !skuKey) return [];
 
-    filteredData.forEach(r => {
+    const statusCol = mapping.ringStatus;
+
+    for (let i = 0; i < filteredData.length; i++) {
+      const r = filteredData[i];
       const val = r[skuKey];
       if (val !== undefined && val !== null) {
         const sku = String(val).trim().replace(/[\u0000-\u001F\u007F-\u009F]/g, ""); 
         if (sku !== '') {
-          if (!skuMap[sku]) {
-            skuMap[sku] = { total: 0, accepted: 0, rejected: 0 };
-          }
-          skuMap[sku].total += 1;
+          if (!skuMap[sku]) skuMap[sku] = { total: 0, accepted: 0, rejected: 0 };
+          skuMap[sku].total++;
           
-          const status = String(r[mapping.ringStatus] || '').trim().toLowerCase();
+          const status = String(r[statusCol] || '').trim().toLowerCase();
           if (['accepted', 'ok', 'pass', '1', 'true', 'yes'].includes(status)) {
-            skuMap[sku].accepted += 1;
+            skuMap[sku].accepted++;
           } else if (['rejected', 'nok', 'fail', '0', 'false', 'no'].includes(status)) {
-            skuMap[sku].rejected += 1;
+            skuMap[sku].rejected++;
           }
         }
       }
-    });
+    }
 
     return Object.entries(skuMap).map(([sku, s]) => ({
       sku,
@@ -570,37 +629,34 @@ const App: React.FC = () => {
     }
 
     const mapping = config.mapping || DEFAULT_MAPPING;
-    
-    const totalData = filteredData.filter(r => 
-      String(r[mapping.uid] || '').trim() !== '' || 
-      String(r[mapping.sku] || '').trim() !== ''
-    );
+    const uidCol = mapping.uid;
+    const skuCol = mapping.sku;
+    const statusCol = mapping.ringStatus;
+    const reasonCol = mapping.reason;
 
-    const acceptedRows = totalData.filter(r => {
-      const status = String(r[mapping.ringStatus] || '').trim().toLowerCase();
-      return ['accepted', 'ok', 'pass', '1', 'true', 'yes'].includes(status);
-    });
-    
     const acceptedGroups: Record<string, number> = {};
-    acceptedRows.forEach(r => {
-      const sku = String(r[mapping.sku] || 'Unknown SKU').trim();
-      acceptedGroups[sku] = (acceptedGroups[sku] || 0) + 1;
-    });
+    const rejectedGroups: Record<string, number> = {};
+
+    for (let i = 0; i < filteredData.length; i++) {
+      const r = filteredData[i];
+      const uid = String(r[uidCol] || '').trim();
+      const sku = String(r[skuCol] || '').trim();
+      
+      if (uid !== '' || sku !== '') {
+        const status = String(r[statusCol] || '').trim().toLowerCase();
+        if (['accepted', 'ok', 'pass', '1', 'true', 'yes'].includes(status)) {
+          const skuVal = sku || 'Unknown SKU';
+          acceptedGroups[skuVal] = (acceptedGroups[skuVal] || 0) + 1;
+        } else if (['rejected', 'nok', 'fail', '0', 'false', 'no'].includes(status)) {
+          const reason = String(r[reasonCol] || 'No Reason Specified').trim();
+          rejectedGroups[reason] = (rejectedGroups[reason] || 0) + 1;
+        }
+      }
+    }
     
     const acceptedDetailsStr = Object.entries(acceptedGroups)
       .map(([sku, count]) => `${sku}: ${count}`)
       .join('\n');
-
-    const rejectedRows = totalData.filter(r => {
-      const status = String(r[mapping.ringStatus] || '').trim().toLowerCase();
-      return ['rejected', 'nok', 'fail', '0', 'false', 'no'].includes(status);
-    });
-    
-    const rejectedGroups: Record<string, number> = {};
-    rejectedRows.forEach(r => {
-      const reason = String(r[mapping.reason] || 'No Reason Specified').trim();
-      rejectedGroups[reason] = (rejectedGroups[reason] || 0) + 1;
-    });
     
     const rejectedDetailsStr = Object.entries(rejectedGroups)
       .map(([reason, count]) => `${reason}: ${count}`)
@@ -623,7 +679,6 @@ ${rejectedDetailsStr || 'None'}
 
     navigator.clipboard.writeText(reportText).then(() => {
       setShowCopyToast(true);
-      // Fixed: Change setShowResetToast to setShowCopyToast to fix reference error
       setTimeout(() => setShowCopyToast(false), 3000);
     }).catch(err => {
       console.error('Failed to copy: ', err);
@@ -669,12 +724,26 @@ ${rejectedDetailsStr || 'None'}
                     REPORT
                   </button>
                 )}
+                <div className="hidden lg:flex items-center bg-[#1e232d] p-1 rounded-xl border border-white/5">
+                  <button 
+                    onClick={() => handleSheetToggle('RT CONVERSION')}
+                    className={`px-4 py-2.5 text-[10px] font-black rounded-lg transition-all uppercase tracking-widest ${config.sheetName === 'RT CONVERSION' ? 'bg-[#38bdf8] text-white shadow-lg shadow-[#38bdf8]/20' : 'text-[#9ca3af] hover:text-white hover:bg-white/5'}`}
+                  >
+                    RT CONVERSION
+                  </button>
+                  <button 
+                    onClick={() => handleSheetToggle('WABI SABI')}
+                    className={`px-4 py-2.5 text-[10px] font-black rounded-lg transition-all uppercase tracking-widest ${config.sheetName === 'WABI SABI' ? 'bg-[#38bdf8] text-white shadow-lg shadow-[#38bdf8]/20' : 'text-[#9ca3af] hover:text-white hover:bg-white/5'}`}
+                  >
+                    WABI SABI
+                  </button>
+                </div>
                 {config.url && (
                   <div className="flex flex-col items-end gap-1">
                     <button 
                       onClick={() => {
                         if (latestDataRef.current) syncLatestData();
-                        else loadData(false);
+                        else loadData(false, true);
                       }} 
                       className="flex items-center gap-2 px-5 py-2.5 text-xs font-black text-[#38bdf8] hover:bg-[#38bdf8]/10 rounded-xl transition-all border border-[#38bdf8]/20 disabled:opacity-50 uppercase tracking-widest" 
                       disabled={loading}

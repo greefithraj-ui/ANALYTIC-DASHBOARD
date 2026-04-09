@@ -2,15 +2,18 @@
 import Papa from 'papaparse';
 import { DashboardRow } from '../types';
 
-export const fetchSheetData = async (url: string, sheetName: string): Promise<{ data: DashboardRow[]; headers: string[] }> => {
+export const fetchSheetData = async (url: string, sheetName: string, query?: string): Promise<{ data: DashboardRow[]; headers: string[] }> => {
   try {
     // Extract Spreadsheet ID from typical URLs
     const match = url.match(/\/d\/(.*?)(\/|$)/);
     if (!match) throw new Error("Invalid Google Sheet URL. Please ensure it follows the standard format.");
     const spreadsheetId = match[1];
     
-    // Construct CSV export URL - explicitly requesting full sheet to avoid range issues
-    const csvUrl = `https://docs.google.com/spreadsheets/d/${spreadsheetId}/gviz/tq?tqx=out:csv&sheet=${encodeURIComponent(sheetName)}`;
+    // Construct CSV export URL
+    let csvUrl = `https://docs.google.com/spreadsheets/d/${spreadsheetId}/gviz/tq?tqx=out:csv&sheet=${encodeURIComponent(sheetName)}`;
+    if (query) {
+      csvUrl += `&tq=${encodeURIComponent(query)}`;
+    }
     
     // Add timeout to fetch call
     const controller = new AbortController();
@@ -106,4 +109,13 @@ export const parseDate = (dateStr: string): Date | null => {
   }
   
   return null;
+};
+
+export const getColLetter = (index: number): string => {
+  let letter = '';
+  while (index >= 0) {
+    letter = String.fromCharCode((index % 26) + 65) + letter;
+    index = Math.floor(index / 26) - 1;
+  }
+  return letter;
 };
