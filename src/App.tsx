@@ -25,6 +25,22 @@ const MemoizedAcceptedDrilldownModal = memo(AcceptedDrilldownModal);
 
 const MemoizedSettingsMenu = memo(SettingsMenu);
 
+const safeLocalStorageSet = (key: string, value: string) => {
+  try {
+    localStorage.setItem(key, value);
+  } catch (error) {
+    console.warn("Storage quota exceeded, clearing cache to prevent crash.");
+    try {
+      localStorage.removeItem('qc_dashboard_cached_data');
+      localStorage.removeItem('qc_dashboard_cached_headers');
+      // Attempt to save again after clearing space
+      localStorage.setItem(key, value); 
+    } catch (fallbackError) {
+      console.error("Storage completely full, bypassing cache entirely.");
+    }
+  }
+};
+
 const App: React.FC = () => {
   const [config, setConfig] = useState<SheetConfig>(() => {
     const saved = localStorage.getItem('qc_dashboard_config');
@@ -163,7 +179,7 @@ const App: React.FC = () => {
       setIsWipModalOpen(false);
     }
     setConfig(newConfig);
-    localStorage.setItem('qc_dashboard_config', JSON.stringify(newConfig));
+    safeLocalStorageSet('qc_dashboard_config', JSON.stringify(newConfig));
   }, [syncLatestData, config.sheetName]);
 
   const handleSheetToggle = (sheetName: string) => {
@@ -173,26 +189,26 @@ const App: React.FC = () => {
 
   // Persistence effects
   useEffect(() => {
-    localStorage.setItem('qc_dashboard_selected_batches', JSON.stringify(selectedBatches));
+    safeLocalStorageSet('qc_dashboard_selected_batches', JSON.stringify(selectedBatches));
   }, [selectedBatches]);
 
   useEffect(() => {
-    localStorage.setItem('qc_dashboard_date_range', JSON.stringify(dateRange));
+    safeLocalStorageSet('qc_dashboard_date_range', JSON.stringify(dateRange));
   }, [dateRange]);
 
   useEffect(() => {
-    localStorage.setItem('qc_dashboard_uid_search', uidSearch);
+    safeLocalStorageSet('qc_dashboard_uid_search', uidSearch);
   }, [uidSearch]);
 
   useEffect(() => {
     if (data.length > 0) {
-      localStorage.setItem('qc_dashboard_cached_data', JSON.stringify(data));
+      safeLocalStorageSet('qc_dashboard_cached_data', JSON.stringify(data));
     }
   }, [data]);
 
   useEffect(() => {
     if (headers.length > 0) {
-      localStorage.setItem('qc_dashboard_cached_headers', JSON.stringify(headers));
+      safeLocalStorageSet('qc_dashboard_cached_headers', JSON.stringify(headers));
     }
   }, [headers]);
 
@@ -321,8 +337,8 @@ const App: React.FC = () => {
         latestMappingRef.current = updatedMapping;
         
         // Still update cache for persistence
-        localStorage.setItem('qc_dashboard_cached_data', JSON.stringify(updatedData));
-        localStorage.setItem('qc_dashboard_cached_headers', JSON.stringify(sheetHeaders));
+        safeLocalStorageSet('qc_dashboard_cached_data', JSON.stringify(updatedData));
+        safeLocalStorageSet('qc_dashboard_cached_headers', JSON.stringify(sheetHeaders));
         
         setError(null);
         return;

@@ -371,7 +371,7 @@ const SKUTrendAnalysisChart: React.FC<SKUTrendAnalysisChartProps> = ({ data, map
       </div>
 
       {/* Chart Area */}
-      <div className={`relative bg-[#161a23]/30 rounded-2xl border border-white/5 p-4 ${isExpanded ? 'flex-1' : 'h-[400px]'}`}>
+      <div className={`relative bg-[#161a23]/30 rounded-2xl border border-white/5 p-4 min-w-0 min-h-0 ${isExpanded ? 'flex-1' : 'h-[400px]'}`}>
         {chartData.length === 0 ? (
           <div className="flex flex-col items-center justify-center h-full gap-4 animate-in fade-in duration-500">
             <div className="p-4 bg-white/5 rounded-full border border-white/5">

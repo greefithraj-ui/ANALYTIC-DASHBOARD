@@ -193,7 +193,7 @@ const KPIGrid: React.FC<KPIGridProps> = ({ stats, loading, onRejectedClick, onAc
                   
                   {/* Sparkline */}
                   {['ACCEPTED', 'REJECTED', 'OVERALL YIELD'].includes(card.label) && trendData.length > 1 && (
-                    <div className="h-10 w-full mt-2">
+                    <div className="h-10 w-full mt-2 min-w-0 min-h-0">
                       <ResponsiveContainer width="100%" height="100%">
                         <LineChart data={trendData}>
                           <defs>
